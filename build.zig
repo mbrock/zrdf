@@ -15,18 +15,12 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // Create the url_parser module
-    const url_parser_module = b.addModule("url_parser", .{
-        .root_source_file = b.path("src/url_parser.zig"),
-    });
-
     const lib = b.addStaticLibrary(.{
         .name = "zrdf",
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lib.addModule("url_parser", url_parser_module);
 
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
@@ -75,7 +69,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    unit_tests.addModule("url_parser", url_parser_module);
 
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
