@@ -1,2 +1,7 @@
-1. 78 char line limit
-2. simple concise commit messages
+Use a 78 char line limit.
+
+When writing commit messages, stay concise and simple.
+
+In Zig, use trailing commas when lines are split.
+
+Define helper functions to make long functions more readable.
