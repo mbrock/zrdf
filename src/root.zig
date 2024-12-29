@@ -454,7 +454,7 @@ pub fn parseObjectList(state: *ParserState, input: []const u8) ParseError!ParseR
 }
 
 pub fn parseObject(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    var rest = skipWhitespace(input);
+    const rest = skipWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
     // Try parsing collection
