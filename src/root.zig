@@ -282,7 +282,7 @@ pub fn parseTriples(state: *ParserState, input: []const u8) ParseError!ParseResu
 }
 
 pub fn parseSubject(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    var rest = skipWhitespace(input);
+    const rest = skipWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
     // Try parsing IRI
@@ -370,7 +370,7 @@ pub fn parsePredicateObjectList(
     state: *ParserState,
     input: []const u8,
 ) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
+    const rest = skipWhitespace(input);
 
     while (true) {
         // Parse predicate
@@ -568,7 +568,7 @@ fn parseLongString(input: []const u8, quotes: []const u8) ParseError!ParseResult
 }
 
 // Add literal parsing
-pub fn parseLiteral(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
+pub fn parseLiteral(_: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
     var rest = skipWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
