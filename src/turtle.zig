@@ -101,51 +101,77 @@ pub fn ParseResult(T: type) type {
     };
 }
 
-/// Parses a URL from N-Quads format: <http://example.org>
-/// Returns the URL without the angle brackets
+/// Convenience function for trimming whitespace off the front of an input slice.
+/// Returns the trimmed slice.
+fn consumeWhitespace(input: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < input.len and std.ascii.isWhitespace(input[i])) : (i += 1) {}
+    return input[i..];
+}
+
+/// Helper to skip a single token (like '.', ',', ';'), trimming whitespace after it.
+/// Returns the trimmed slice.
+fn consumeSingleToken(input: []const u8, token: u8) ParseError![]const u8 {
+    var rest = consumeWhitespace(input);
+    if (rest.len == 0 or rest[0] != token) {
+        return ParseError.InvalidStatement;
+    }
+    return consumeWhitespace(rest[1..]);
+}
+
+/// Helper to read a bracketed IRI like `<http://...>`
+/// and return the URL plus the remaining input.
 pub fn readBracketedURI(input: []const u8) ParseError!ParseResult(URL) {
-    if (input.len < 2)
-        return ParseError.EmptyURL;
-    if (input[0] != '<')
-        return ParseError.MissingOpenBracket;
+    var rest = consumeWhitespace(input);
+
+    if (rest.len < 2) return ParseError.EmptyURL;
+    if (rest[0] != '<') return ParseError.MissingOpenBracket;
 
     var pos: usize = 1;
-    while (pos < input.len) {
-        if (input[pos] == '>') {
-            if (pos == 1) return ParseError.EmptyURL;
+    while (pos < rest.len) {
+        if (rest[pos] == '>') {
+            if (pos == 1) return ParseError.EmptyURL; // empty < >
             return ParseResult(URL){
-                .value = URL{ .url = input[1..pos] },
-                .rest = input[pos + 1 ..],
+                .value = URL{ .url = rest[1..pos] },
+                .rest = rest[pos + 1 ..],
             };
         }
         pos += 1;
     }
-
     return ParseError.MissingCloseBracket;
 }
 
-// Add helper function to skip whitespace
-fn skipWhitespace(input: []const u8) []const u8 {
-    var rest = input;
-    while (rest.len > 0 and std.ascii.isWhitespace(rest[0])) {
-        rest = rest[1..];
+// Factor out repeated code for reading @base and @prefix directives
+fn parseDirective(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
+    var rest = consumeWhitespace(input);
+
+    // Check for @prefix
+    if (std.mem.startsWith(u8, rest, "@prefix")) {
+        const result = try parsePrefix(state, rest);
+        rest = consumeWhitespace(result.rest);
+        rest = try consumeSingleToken(rest, '.'); // consume the trailing '.'
+        return ParseResult(void){ .value = {}, .rest = rest };
     }
-    return rest;
+    // Check for @base
+    else if (std.mem.startsWith(u8, rest, "@base")) {
+        const result = try parseBase(state, rest);
+        rest = consumeWhitespace(result.rest);
+        rest = try consumeSingleToken(rest, '.');
+        return ParseResult(void){ .value = {}, .rest = rest };
+    }
+
+    // Not a recognized directive
+    return ParseError.InvalidStatement;
 }
 
+// Example of factoring out whitespace skipping in parseBase
 pub fn parseBase(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    // Skip @base
-    if (!std.mem.startsWith(u8, input, "@base")) {
+    var rest = consumeWhitespace(input);
+    if (!std.mem.startsWith(u8, rest, "@base")) {
         return ParseError.InvalidBase;
     }
+    rest = consumeWhitespace(rest[5..]); // skip "@base"
 
-    var rest = input[5..];
-    // Skip whitespace
-    while (rest.len > 0 and std.ascii.isWhitespace(rest[0])) {
-        rest = rest[1..];
-    }
-
-    // Parse IRI
     const iri = try readBracketedURI(rest);
     state.base_uri = iri.value;
 
@@ -156,30 +182,20 @@ pub fn parseBase(state: *ParserState, input: []const u8) ParseError!ParseResult(
 }
 
 pub fn parsePrefix(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    // Skip @prefix
-    if (!std.mem.startsWith(u8, input, "@prefix")) {
+    var rest = consumeWhitespace(input);
+    if (!std.mem.startsWith(u8, rest, "@prefix")) {
         return ParseError.InvalidPrefix;
     }
+    rest = consumeWhitespace(rest[7..]); // skip "@prefix"
 
-    var rest = input[7..];
-    // Skip whitespace
-    while (rest.len > 0 and std.ascii.isWhitespace(rest[0])) {
-        rest = rest[1..];
-    }
-
-    // Parse prefix name until :
+    // Parse prefix name until ':'
     const colon_pos = std.mem.indexOf(u8, rest, ":");
     if (colon_pos == null) return ParseError.InvalidPrefix;
 
     const prefix_name = rest[0..colon_pos.?];
-    rest = rest[colon_pos.? + 1 ..];
+    rest = consumeWhitespace(rest[colon_pos.? + 1 ..]);
 
-    // Skip whitespace
-    while (rest.len > 0 and std.ascii.isWhitespace(rest[0])) {
-        rest = rest[1..];
-    }
-
-    // Parse IRI
+    // Parse bracketed IRI
     const iri = try readBracketedURI(rest);
     try state.prefixes.put(prefix_name, iri.value);
 
@@ -189,29 +205,28 @@ pub fn parsePrefix(state: *ParserState, input: []const u8) ParseError!ParseResul
     };
 }
 
-// Add blank node parsing
+// Blank node parsing
 pub fn parseBlankNode(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    if (!std.mem.startsWith(u8, input, "_:")) {
+    var rest = consumeWhitespace(input);
+    if (!std.mem.startsWith(u8, rest, "_:")) {
         return ParseError.InvalidBlankNode;
     }
 
-    var rest = input[2..];
+    rest = rest[2..];
     var end: usize = 0;
-
-    // Find end of blank node label
-    while (end < rest.len and !std.ascii.isWhitespace(rest[end])) {
+    while (end < rest.len and !std.ascii.isWhitespace(rest[end]) and !isTurtleDelimiter(rest[end])) {
         end += 1;
     }
 
     if (end == 0) return ParseError.InvalidBlankNode;
 
     const label = rest[0..end];
+    rest = rest[end..];
 
-    // Check if we've seen this blank node before
     if (state.bnode_labels.get(label)) |existing| {
         return ParseResult(Term){
             .value = Term{ .bnode = existing },
-            .rest = rest[end..],
+            .rest = rest,
         };
     }
 
@@ -221,31 +236,38 @@ pub fn parseBlankNode(state: *ParserState, input: []const u8) ParseError!ParseRe
 
     return ParseResult(Term){
         .value = Term{ .bnode = bnode },
-        .rest = rest[end..],
+        .rest = rest,
     };
 }
 
-// Add predicate-object list parsing
-pub fn parsePredicateObjectList(
-    state: *ParserState,
-    input: []const u8,
-) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
+/// Check if a given character is a Turtle delimiter (commas, semicolons, parentheses, etc.)
+fn isTurtleDelimiter(c: u8) bool {
+    return switch (c) {
+        '.', ',', ';', '(', ')', '[', ']' => true,
+        else => false,
+    };
+}
+
+// Factor out for parsePredicateObjectList
+pub fn parsePredicateObjectList(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
+    var rest = consumeWhitespace(input);
 
     while (true) {
         // Parse predicate
         const pred = try parsePredicate(state, rest);
-        rest = skipWhitespace(pred.rest);
+        rest = consumeWhitespace(pred.rest);
         state.cur_predicate = pred.value;
 
         // Parse object list
         const obj_list = try parseObjectList(state, rest);
-        rest = skipWhitespace(obj_list.rest);
+        rest = consumeWhitespace(obj_list.rest);
 
         // Check for another predicate-object pair
         if (rest.len > 0 and rest[0] == ';') {
-            rest = skipWhitespace(rest[1..]);
-            if (rest.len > 0 and rest[0] != '.') continue;
+            rest = consumeWhitespace(rest[1..]);
+            if (rest.len > 0 and rest[0] != '.') {
+                continue;
+            }
         }
         break;
     }
@@ -257,21 +279,18 @@ pub fn parsePredicateObjectList(
 }
 
 pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    const rest = skipWhitespace(input);
+    var rest = consumeWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
-    // Handle 'a' as rdf:type shorthand
+    // rdf:type shorthand
     if (rest[0] == 'a' and
-        (rest.len == 1 or std.ascii.isWhitespace(rest[1])))
+        (rest.len == 1 or std.ascii.isWhitespace(rest[1]) or isTurtleDelimiter(rest[1])))
     {
         const rdf_type = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" };
-        return ParseResult(Term){
-            .value = Term{ .uri = rdf_type },
-            .rest = rest[1..],
-        };
+        return ParseResult(Term){ .value = Term{ .uri = rdf_type }, .rest = rest[1..] };
     }
 
-    // Try parsing IRI
+    // Bracketed IRI
     if (rest[0] == '<') {
         const iri = try readBracketedURI(rest);
         return ParseResult(Term){
@@ -280,7 +299,7 @@ pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseRe
         };
     }
 
-    // Try parsing prefixed name
+    // Prefixed name
     const prefixed = try parsePrefixedName(state, rest);
     return ParseResult(Term){
         .value = Term{ .uri = prefixed.value },
@@ -289,19 +308,19 @@ pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseRe
 }
 
 pub fn parseObjectList(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
+    var rest = consumeWhitespace(input);
 
     while (true) {
         // Parse object
         const obj = try parseObject(state, rest);
-        rest = skipWhitespace(obj.rest);
+        rest = consumeWhitespace(obj.rest);
 
         // Emit triple
         try state.emitTriple(obj.value);
 
         // Check for another object
         if (rest.len > 0 and rest[0] == ',') {
-            rest = skipWhitespace(rest[1..]);
+            rest = consumeWhitespace(rest[1..]);
             continue;
         }
         break;
@@ -314,43 +333,35 @@ pub fn parseObjectList(state: *ParserState, input: []const u8) ParseError!ParseR
 }
 
 pub fn parseObject(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    const rest = skipWhitespace(input);
+    const rest = consumeWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
-    // Try parsing collection
+    // Collection
     if (rest[0] == '(') {
         return parseCollection(state, rest);
     }
-
-    // Try parsing blank node property list
+    // Blank node property list
     if (rest[0] == '[') {
         return parseBlankNodePropertyList(state, rest);
     }
-
-    // Try parsing IRI
+    // IRI
     if (rest[0] == '<') {
         const iri = try readBracketedURI(rest);
-        return ParseResult(Term){
-            .value = Term{ .uri = iri.value },
-            .rest = iri.rest,
-        };
+        return ParseResult(Term){ .value = Term{ .uri = iri.value }, .rest = iri.rest };
     }
-
-    // Try parsing blank node
+    // Blank node
     if (std.mem.startsWith(u8, rest, "_:")) {
         return parseBlankNode(state, rest);
     }
-
-    // Try parsing literal
+    // Literal (string, numeric, boolean)
     if (rest[0] == '"' or rest[0] == '\'' or
         isDigit(rest[0]) or rest[0] == '+' or rest[0] == '-' or
-        std.mem.startsWith(u8, rest, "true") or
-        std.mem.startsWith(u8, rest, "false"))
+        std.mem.startsWith(u8, rest, "true") or std.mem.startsWith(u8, rest, "false"))
     {
         return parseLiteral(state, rest);
     }
 
-    // Try parsing prefixed name
+    // Prefixed name
     const prefixed = try parsePrefixedName(state, rest);
     return ParseResult(Term){
         .value = Term{ .uri = prefixed.value },
@@ -358,19 +369,19 @@ pub fn parseObject(state: *ParserState, input: []const u8) ParseError!ParseResul
     };
 }
 
-// Add string literal parsing
+// String literal parsing
 pub fn parseString(input: []const u8) ParseError!ParseResult([]const u8) {
-    if (input.len < 2) return ParseError.InvalidString;
+    const rest = consumeWhitespace(input);
+    if (rest.len < 2) return ParseError.InvalidString;
 
-    // Handle different quote types
-    if (std.mem.startsWith(u8, input, "\"\"\"")) {
-        return parseLongString(input, "\"\"\"");
-    } else if (std.mem.startsWith(u8, input, "'''")) {
-        return parseLongString(input, "'''");
-    } else if (input[0] == '"') {
-        return parseQuotedString(input, "\"");
-    } else if (input[0] == '\'') {
-        return parseQuotedString(input, "'");
+    if (std.mem.startsWith(u8, rest, "\"\"\"")) {
+        return parseLongString(rest, "\"\"\"");
+    } else if (std.mem.startsWith(u8, rest, "'''")) {
+        return parseLongString(rest, "'''");
+    } else if (rest[0] == '"') {
+        return parseQuotedString(rest, "\"");
+    } else if (rest[0] == '\'') {
+        return parseQuotedString(rest, "'");
     }
 
     return ParseError.InvalidString;
@@ -380,13 +391,11 @@ fn parseQuotedString(input: []const u8, quote: []const u8) ParseError!ParseResul
     if (input.len < 2) return ParseError.InvalidString;
     if (!std.mem.startsWith(u8, input, quote)) return ParseError.InvalidString;
 
-    var pos: usize = 1;
+    var pos: usize = quote.len; // typically 1
     while (pos < input.len) {
-        if (input[pos] == quote[0] and
-            (pos == 1 or input[pos - 1] != '\\'))
-        {
+        if (input[pos] == quote[0] and (pos == quote.len or input[pos - 1] != '\\')) {
             return ParseResult([]const u8){
-                .value = input[1..pos],
+                .value = input[quote.len..pos],
                 .rest = input[pos + 1 ..],
             };
         }
@@ -396,18 +405,15 @@ fn parseQuotedString(input: []const u8, quote: []const u8) ParseError!ParseResul
 }
 
 fn parseLongString(input: []const u8, quotes: []const u8) ParseError!ParseResult([]const u8) {
-    if (input.len < 6) return ParseError.InvalidString;
+    if (input.len < quotes.len * 2) return ParseError.InvalidString;
     if (!std.mem.startsWith(u8, input, quotes)) return ParseError.InvalidString;
 
-    // Find closing quotes
-    var pos: usize = 3;
-    while (pos < input.len - 2) {
-        if (std.mem.startsWith(u8, input[pos..], quotes) and
-            input[pos - 1] != '\\')
-        {
+    var pos: usize = quotes.len; // typically 3
+    while (pos + quotes.len <= input.len) {
+        if (std.mem.startsWith(u8, input[pos..], quotes) and (pos == quotes.len or input[pos - 1] != '\\')) {
             return ParseResult([]const u8){
-                .value = input[3..pos],
-                .rest = input[pos + 3 ..],
+                .value = input[quotes.len..pos],
+                .rest = input[pos + quotes.len ..],
             };
         }
         pos += 1;
@@ -416,77 +422,63 @@ fn parseLongString(input: []const u8, quotes: []const u8) ParseError!ParseResult
 }
 
 fn parseLanguageTag(input: []const u8) ParseError!ParseResult([]const u8) {
-    if (input.len < 2) return ParseError.InvalidLanguageTag;
-    if (input[0] != '@') return ParseError.InvalidLanguageTag;
+    var rest = consumeWhitespace(input);
+    if (rest.len < 2) return ParseError.InvalidLanguageTag;
+    if (rest[0] != '@') return ParseError.InvalidLanguageTag;
 
     var pos: usize = 1;
-    while (pos < input.len and
-        (std.ascii.isAlphabetic(input[pos]) or
-        input[pos] == '-'))
-    {
+    while (pos < rest.len and (std.ascii.isAlphabetic(rest[pos]) or rest[pos] == '-')) {
         pos += 1;
     }
-
     if (pos == 1) return ParseError.InvalidLanguageTag;
 
     return ParseResult([]const u8){
-        .value = input[1..pos],
-        .rest = input[pos..],
+        .value = rest[1..pos],
+        .rest = rest[pos..],
     };
 }
 
-// Add these helper functions for number parsing
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
 fn parseNumber(input: []const u8) ParseError!ParseResult(Term) {
-    var rest = input;
-    var has_sign = false;
+    var rest = consumeWhitespace(input);
+
+    var pos: usize = 0;
     var has_decimal = false;
     var has_exponent = false;
-    var pos: usize = 0;
 
-    // Handle optional sign
+    // Optional sign
     if (pos < rest.len and (rest[pos] == '+' or rest[pos] == '-')) {
-        has_sign = true;
         pos += 1;
     }
 
-    // Parse integer part
     const start_digits = pos;
-    while (pos < rest.len and isDigit(rest[pos])) {
-        pos += 1;
-    }
+    // integer part
+    while (pos < rest.len and isDigit(rest[pos])) : (pos += 1) {}
 
-    // Check for decimal point
+    // decimal point
     if (pos < rest.len and rest[pos] == '.') {
         has_decimal = true;
         pos += 1;
-        // Parse decimal digits
-        while (pos < rest.len and isDigit(rest[pos])) {
-            pos += 1;
-        }
+        while (pos < rest.len and isDigit(rest[pos])) : (pos += 1) {}
     }
 
-    // Check for exponent
+    // exponent
     if (pos < rest.len and (rest[pos] == 'e' or rest[pos] == 'E')) {
         has_exponent = true;
         pos += 1;
-        // Handle optional exponent sign
         if (pos < rest.len and (rest[pos] == '+' or rest[pos] == '-')) {
             pos += 1;
         }
-        // Parse exponent digits
         var has_exp_digits = false;
-        while (pos < rest.len and isDigit(rest[pos])) {
+        while (pos < rest.len and isDigit(rest[pos])) : (pos += 1) {
             has_exp_digits = true;
-            pos += 1;
         }
         if (!has_exp_digits) return ParseError.InvalidNumber;
     }
 
-    // Validate number format
     if (pos == start_digits and !has_decimal) {
         return ParseError.InvalidNumber;
     }
@@ -511,20 +503,20 @@ fn parseNumber(input: []const u8) ParseError!ParseResult(Term) {
 
 pub fn parseLiteral(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
     _ = state; // autofix
-    var rest = skipWhitespace(input);
+    var rest = consumeWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
-    // Try parsing string literal
+    // string literal
     if (rest[0] == '"' or rest[0] == '\'') {
-        const str = try parseString(rest);
-        rest = skipWhitespace(str.rest);
+        const str_result = try parseString(rest);
+        rest = consumeWhitespace(str_result.rest);
 
-        // Check for language tag or datatype
+        // optional language tag or datatype
         if (rest.len > 0 and rest[0] == '@') {
             const lang = try parseLanguageTag(rest);
             return ParseResult(Term){
                 .value = Term{ .lit = .{
-                    .value = str.value,
+                    .value = str_result.value,
                     .lang = lang.value,
                     .datatype = null,
                 } },
@@ -535,29 +527,26 @@ pub fn parseLiteral(state: *ParserState, input: []const u8) ParseError!ParseResu
             const dtype = try readBracketedURI(rest);
             return ParseResult(Term){
                 .value = Term{ .lit = .{
-                    .value = str.value,
+                    .value = str_result.value,
                     .lang = null,
                     .datatype = dtype.value,
                 } },
                 .rest = dtype.rest,
             };
         }
-
-        // Plain string literal
+        // plain string
         return ParseResult(Term){
             .value = Term{ .lit = .{
-                .value = str.value,
+                .value = str_result.value,
                 .lang = null,
                 .datatype = null,
             } },
-            .rest = str.rest,
+            .rest = str_result.rest,
         };
     }
 
-    // Try parsing boolean
-    if (std.mem.startsWith(u8, rest, "true") or
-        std.mem.startsWith(u8, rest, "false"))
-    {
+    // boolean
+    if (std.mem.startsWith(u8, rest, "true") or std.mem.startsWith(u8, rest, "false")) {
         const bool_str = if (rest[0] == 't') "true" else "false";
         const val = rest[0..bool_str.len];
         return ParseResult(Term){
@@ -570,7 +559,7 @@ pub fn parseLiteral(state: *ParserState, input: []const u8) ParseError!ParseResu
         };
     }
 
-    // Try parsing number
+    // numeric
     if (isDigit(rest[0]) or
         ((rest[0] == '+' or rest[0] == '-') and rest.len > 1 and isDigit(rest[1])) or
         (rest[0] == '.' and rest.len > 1 and isDigit(rest[1])))
@@ -581,62 +570,57 @@ pub fn parseLiteral(state: *ParserState, input: []const u8) ParseError!ParseResu
     return ParseError.InvalidLiteral;
 }
 
-// Add collection parsing
+// Collection parsing
 pub fn parseCollection(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    var rest = skipWhitespace(input);
+    var rest = consumeWhitespace(input);
     if (rest.len == 0 or rest[0] != '(') return ParseError.InvalidCollection;
-    rest = skipWhitespace(rest[1..]);
+    rest = consumeWhitespace(rest[1..]);
 
-    // Handle empty collection
+    // Empty collection
     if (rest.len > 0 and rest[0] == ')') {
         return ParseResult(Term){
             .value = Term{
-                .uri = URL{
-                    .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
-                },
+                .uri = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil" },
             },
             .rest = rest[1..],
         };
     }
 
-    // Parse first object
+    // first object
     const first_obj = try parseObject(state, rest);
-    rest = skipWhitespace(first_obj.rest);
+    rest = consumeWhitespace(first_obj.rest);
 
-    // Create first blank node
     const first_bnode = BNode{ .id = try generateBNodeId(state) };
     try state.bnode_labels.put(first_bnode.id, first_bnode);
 
-    // Save current subject/predicate
+    // store for later restore
     const saved_subject = state.cur_subject;
     const saved_predicate = state.cur_predicate;
 
-    // Set first/rest predicates
     const first_pred = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first" };
     const rest_pred = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest" };
 
-    // Create first triple
+    // first triple
     state.cur_subject = Term{ .bnode = first_bnode };
     state.cur_predicate = Term{ .uri = first_pred };
     try state.emitTriple(first_obj.value);
 
     var current_bnode = first_bnode;
 
-    // Parse remaining objects
+    // parse remaining objects
     while (rest.len > 0 and rest[0] != ')') {
         const next_obj = try parseObject(state, rest);
-        rest = skipWhitespace(next_obj.rest);
+        rest = consumeWhitespace(next_obj.rest);
 
-        // Create next blank node
         const next_bnode = BNode{ .id = try generateBNodeId(state) };
         try state.bnode_labels.put(next_bnode.id, next_bnode);
 
-        // Link current to next with rdf:rest
+        // link current
         state.cur_subject = Term{ .bnode = current_bnode };
         state.cur_predicate = Term{ .uri = rest_pred };
         try state.emitTriple(Term{ .bnode = next_bnode });
 
-        // Add rdf:first triple for next object
+        // next triple
         state.cur_subject = Term{ .bnode = next_bnode };
         state.cur_predicate = Term{ .uri = first_pred };
         try state.emitTriple(next_obj.value);
@@ -644,12 +628,12 @@ pub fn parseCollection(state: *ParserState, input: []const u8) ParseError!ParseR
         current_bnode = next_bnode;
     }
 
-    // Add final rdf:rest triple pointing to rdf:nil
+    // final rest -> nil
     state.cur_subject = Term{ .bnode = current_bnode };
     state.cur_predicate = Term{ .uri = rest_pred };
     try state.emitTriple(Term{ .uri = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil" } });
 
-    // Restore subject/predicate
+    // restore
     state.cur_subject = saved_subject;
     state.cur_predicate = saved_predicate;
 
@@ -661,19 +645,16 @@ pub fn parseCollection(state: *ParserState, input: []const u8) ParseError!ParseR
     };
 }
 
-// Helper to generate unique blank node IDs
 fn generateBNodeId(state: *ParserState) ![]const u8 {
-    // For now just use a counter - could be more sophisticated
     const count = state.bnode_labels.count();
-    const id = try std.fmt.allocPrint(state.allocator, "b{d}", .{count});
-    return id;
+    return std.fmt.allocPrint(state.allocator, "b{d}", .{count});
 }
 
 pub fn parsePrefixedName(state: *ParserState, input: []const u8) ParseError!ParseResult(URL) {
-    var rest = input;
+    var rest = consumeWhitespace(input);
     var prefix_end: usize = 0;
 
-    // Find the colon separator
+    // find the colon
     while (prefix_end < rest.len and rest[prefix_end] != ':') {
         prefix_end += 1;
     }
@@ -682,46 +663,50 @@ pub fn parsePrefixedName(state: *ParserState, input: []const u8) ParseError!Pars
     const prefix = rest[0..prefix_end];
     rest = rest[prefix_end + 1 ..];
 
-    // Find end of local name
+    // find end of local name
     var local_end: usize = 0;
-    while (local_end < rest.len and !std.ascii.isWhitespace(rest[local_end]) and
-        rest[local_end] != '.' and rest[local_end] != ';' and
-        rest[local_end] != ',' and rest[local_end] != ')')
+    while (local_end < rest.len and
+        !std.ascii.isWhitespace(rest[local_end]) and
+        !isTurtleDelimiter(rest[local_end]))
     {
         local_end += 1;
     }
     if (local_end == 0) return ParseError.InvalidPrefixedName;
 
     const local = rest[0..local_end];
+    rest = rest[local_end..];
 
-    // Look up prefix in state
+    // look up prefix in state
     const base_iri = if (prefix.len == 0)
         state.prefixes.get("") orelse return ParseError.InvalidPrefix
     else
         state.prefixes.get(prefix) orelse return ParseError.InvalidPrefix;
 
-    // Create full URL
-    const full_url = try std.fmt.allocPrint(
-        state.allocator,
-        "{s}{s}",
-        .{ base_iri.url, local },
-    );
+    const full_url = try std.fmt.allocPrint(state.allocator, "{s}{s}", .{ base_iri.url, local });
 
     return ParseResult(URL){
         .value = URL{ .url = full_url },
-        .rest = rest[local_end..],
+        .rest = rest,
     };
 }
 
-// Add turtle document parsing
+// High-level: parse an entire Turtle document
 pub fn parseTurtleDocument(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
+    var rest = consumeWhitespace(input);
+
     while (rest.len > 0) {
-        rest = skipWhitespace(rest);
+        rest = consumeWhitespace(rest);
         if (rest.len == 0) break;
 
-        const result = try parseStatement(state, rest);
-        rest = result.rest;
+        // Either parse a directive (@prefix/@base) or a statement
+        // In some Turtle variants, there might also be @keywords, but let's keep it simple.
+        if (std.mem.startsWith(u8, rest, "@base") or std.mem.startsWith(u8, rest, "@prefix")) {
+            const dir_result = try parseDirective(state, rest);
+            rest = consumeWhitespace(dir_result.rest);
+        } else {
+            const stmt_result = try parseStatement(state, rest);
+            rest = consumeWhitespace(stmt_result.rest);
+        }
     }
 
     return ParseResult(void){
@@ -730,16 +715,95 @@ pub fn parseTurtleDocument(state: *ParserState, input: []const u8) ParseError!Pa
     };
 }
 
+pub fn parseStatement(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
+    var rest = consumeWhitespace(input);
+    if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
+
+    // Attempt to parse a triple
+    const triple_result = try parseTriples(state, rest);
+    rest = consumeWhitespace(triple_result.rest);
+
+    // Expect a '.' at the end
+    if (rest.len == 0 or rest[0] != '.') {
+        return ParseError.InvalidStatement;
+    }
+    return ParseResult(void){ .value = {}, .rest = rest[1..] };
+}
+
+pub fn parseTriples(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
+    var rest = consumeWhitespace(input);
+
+    // subject
+    const subject = try parseSubject(state, rest);
+    rest = consumeWhitespace(subject.rest);
+    state.cur_subject = subject.value;
+
+    // predicate-object list
+    const po_list = try parsePredicateObjectList(state, rest);
+    rest = po_list.rest;
+
+    return ParseResult(void){ .value = {}, .rest = rest };
+}
+
+pub fn parseSubject(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
+    const rest = consumeWhitespace(input);
+    if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
+
+    if (rest[0] == '<') {
+        // IRI
+        const iri = try readBracketedURI(rest);
+        return ParseResult(Term){ .value = Term{ .uri = iri.value }, .rest = iri.rest };
+    }
+    if (std.mem.startsWith(u8, rest, "_:")) {
+        // blank node
+        return parseBlankNode(state, rest);
+    }
+    // prefixed
+    const prefixed = try parsePrefixedName(state, rest);
+    return ParseResult(Term){ .value = Term{ .uri = prefixed.value }, .rest = prefixed.rest };
+}
+
+pub fn parseBlankNodePropertyList(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
+    var rest = consumeWhitespace(input);
+    if (rest.len == 0 or rest[0] != '[') return ParseError.InvalidBlankNode;
+    rest = consumeWhitespace(rest[1..]);
+
+    const bnode = BNode{ .id = try generateBNodeId(state) };
+    try state.bnode_labels.put(bnode.id, bnode);
+
+    // Save current subject/predicate
+    const saved_subject = state.cur_subject;
+    const saved_predicate = state.cur_predicate;
+
+    // Switch subject to new blank node
+    state.cur_subject = Term{ .bnode = bnode };
+
+    // If not empty, parse the predicate-object list
+    if (rest.len > 0 and rest[0] != ']') {
+        const po_list = try parsePredicateObjectList(state, rest);
+        rest = consumeWhitespace(po_list.rest);
+    }
+
+    // Restore
+    state.cur_subject = saved_subject;
+    state.cur_predicate = saved_predicate;
+
+    if (rest.len == 0 or rest[0] != ']') return ParseError.InvalidBlankNode;
+
+    return ParseResult(Term){
+        .value = Term{ .bnode = bnode },
+        .rest = rest[1..],
+    };
+}
+
+// -------------------
+// Example tests follow
+// -------------------
+
 test "parse string literal" {
     const input = "\"hello world\"";
     const result = try parseString(input);
     try std.testing.expectEqualStrings("hello world", result.value);
-}
-
-test "parse long string literal" {
-    const input = "\"\"\"hello\nworld\"\"\"";
-    const result = try parseString(input);
-    try std.testing.expectEqualStrings("hello\nworld", result.value);
 }
 
 test "parse literal with language tag" {
@@ -750,6 +814,12 @@ test "parse literal with language tag" {
     const result = try parseLiteral(&state, input);
     try std.testing.expectEqualStrings("hello", result.value.lit.value);
     try std.testing.expectEqualStrings("en", result.value.lit.lang.?);
+}
+
+test "parse long string literal" {
+    const input = "\"\"\"hello\nworld\"\"\"";
+    const result = try parseString(input);
+    try std.testing.expectEqualStrings("hello\nworld", result.value);
 }
 
 test "parse boolean literal" {
@@ -1012,119 +1082,6 @@ test "parse empty list in different contexts" {
     }
 
     try std.testing.expect(nil_count >= 3);
-}
-
-// Add statement parsing
-pub fn parseStatement(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
-    if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
-
-    // Try parsing directive
-    if (std.mem.startsWith(u8, rest, "@prefix")) {
-        const result = try parsePrefix(state, rest);
-        rest = skipWhitespace(result.rest);
-        if (rest.len == 0 or rest[0] != '.') {
-            return ParseError.InvalidStatement;
-        }
-        return ParseResult(void){ .value = {}, .rest = rest[1..] };
-    } else if (std.mem.startsWith(u8, rest, "@base")) {
-        const result = try parseBase(state, rest);
-        rest = skipWhitespace(result.rest);
-        if (rest.len == 0 or rest[0] != '.') {
-            return ParseError.InvalidStatement;
-        }
-        return ParseResult(void){ .value = {}, .rest = rest[1..] };
-    }
-
-    // Otherwise try parsing triples
-    const triple_result = try parseTriples(state, rest);
-    rest = skipWhitespace(triple_result.rest);
-    if (rest.len == 0 or rest[0] != '.') {
-        return ParseError.InvalidStatement;
-    }
-    return ParseResult(void){
-        .value = {},
-        .rest = rest[1..],
-    };
-}
-
-pub fn parseTriples(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
-
-    // Parse subject
-    const subject = try parseSubject(state, rest);
-    rest = skipWhitespace(subject.rest);
-    state.cur_subject = subject.value;
-
-    // Parse predicate-object list
-    const po_list = try parsePredicateObjectList(state, rest);
-    rest = po_list.rest;
-
-    return ParseResult(void){
-        .value = {},
-        .rest = rest,
-    };
-}
-
-pub fn parseSubject(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    const rest = skipWhitespace(input);
-    if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
-
-    // Try parsing IRI
-    if (rest[0] == '<') {
-        const iri = try readBracketedURI(rest);
-        return ParseResult(Term){
-            .value = Term{ .uri = iri.value },
-            .rest = iri.rest,
-        };
-    }
-
-    // Try parsing blank node
-    if (std.mem.startsWith(u8, rest, "_:")) {
-        return parseBlankNode(state, rest);
-    }
-
-    // Try parsing prefixed name
-    const prefixed = try parsePrefixedName(state, rest);
-    return ParseResult(Term){
-        .value = Term{ .uri = prefixed.value },
-        .rest = prefixed.rest,
-    };
-}
-
-// Add blank node property list parsing
-pub fn parseBlankNodePropertyList(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    var rest = skipWhitespace(input);
-    if (rest.len == 0 or rest[0] != '[') return ParseError.InvalidBlankNode;
-    rest = skipWhitespace(rest[1..]);
-
-    // Create new blank node
-    const bnode = BNode{ .id = try generateBNodeId(state) };
-    try state.bnode_labels.put(bnode.id, bnode);
-
-    // Save current subject/predicate
-    const saved_subject = state.cur_subject;
-    const saved_predicate = state.cur_predicate;
-
-    // Set new subject
-    state.cur_subject = Term{ .bnode = bnode };
-
-    // Parse predicate-object list if not empty
-    if (rest.len > 0 and rest[0] != ']') {
-        const po_list = try parsePredicateObjectList(state, rest);
-        rest = skipWhitespace(po_list.rest);
-    }
-
-    // Restore subject/predicate
-    state.cur_subject = saved_subject;
-    state.cur_predicate = saved_predicate;
-
-    if (rest.len == 0 or rest[0] != ']') return ParseError.InvalidBlankNode;
-
-    return ParseResult(Term){
-        .value = Term{ .bnode = bnode },
-        .rest = rest[1..],
-    };
 }
 
 test "parse blank node property list" {
