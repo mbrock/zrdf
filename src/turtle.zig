@@ -53,19 +53,33 @@ pub const Triple = struct {
 pub const Graph = struct {
     triples: std.ArrayList(Triple),
     uris: std.ArrayList(URI),
+    uri_map: std.StringHashMap(u28),
+
+    pub fn init(allocator: std.mem.Allocator) Graph {
+        return .{
+            .triples = std.ArrayList(Triple).init(allocator),
+            .uris = std.ArrayList(URI).init(allocator),
+            .uri_map = std.StringHashMap(u28).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Graph) void {
+        self.triples.deinit();
+        self.uris.deinit();
+        self.uri_map.deinit();
+    }
 
     pub fn intern(self: *Graph, uri: []const u8) !u28 {
-        // find the uri in the list
-        var i: u28 = 0;
-        for (self.uris.items) |u| {
-            if (std.mem.eql(u8, u.str, uri)) {
-                return i;
-            }
-            i += 1;
+        // Check if URI already exists in hash map
+        if (self.uri_map.get(uri)) |id| {
+            return id;
         }
-        // if not found, add it to the list
+
+        // If not found, add to list and map
+        const id: u28 = @intCast(self.uris.items.len);
         try self.uris.append(URI{ .str = uri });
-        return @intCast(self.uris.items.len - 1);
+        try self.uri_map.put(uri, id);
+        return id;
     }
 
     pub fn getURI(self: *Graph, id: u28) !URI {
@@ -74,6 +88,23 @@ pub const Graph = struct {
 
     pub fn getURIString(self: *Graph, id: u28) ![]const u8 {
         return self.uris.items[id].str;
+    }
+
+    pub fn printTerm(self: *Graph, stdout: anytype, term: Term) !void {
+        switch (term) {
+            .uri => |uri| stdout.print("<{s}>", .{self.getURIString(uri) catch return}) catch {},
+            .bno => |bnode| stdout.print("_:{s}", .{bnode.str}) catch {},
+            .lit => |lit| stdout.print("\"{s}\"", .{lit.value}) catch {},
+        }
+    }
+
+    pub fn printTriple(self: *Graph, stdout: anytype, triple: Triple) !void {
+        try self.printTerm(stdout, triple.s);
+        try stdout.print(" ", .{});
+        try self.printTerm(stdout, triple.p);
+        try stdout.print(" ", .{});
+        try self.printTerm(stdout, triple.o);
+        try stdout.print(" .\n", .{});
     }
 };
 
@@ -86,6 +117,18 @@ pub const ParserState = struct {
     allocator: std.mem.Allocator,
     graph: Graph,
 
+    pub fn initWithGraph(allocator: std.mem.Allocator, graph: Graph) ParserState {
+        return .{
+            .base_uri = null,
+            .prefixes = std.StringHashMap(URI).init(allocator),
+            .bnode_labels = std.StringHashMap(BNode).init(allocator),
+            .cur_subject = null,
+            .cur_predicate = null,
+            .allocator = allocator,
+            .graph = graph,
+        };
+    }
+
     pub fn init(allocator: std.mem.Allocator) ParserState {
         return .{
             .base_uri = null,
@@ -94,18 +137,13 @@ pub const ParserState = struct {
             .cur_subject = null,
             .cur_predicate = null,
             .allocator = allocator,
-            .graph = Graph{
-                .triples = std.ArrayList(Triple).init(allocator),
-                .uris = std.ArrayList(URI).init(allocator),
-            },
+            .graph = Graph.init(allocator),
         };
     }
 
     pub fn deinit(self: *ParserState) void {
         self.prefixes.deinit();
         self.bnode_labels.deinit();
-        self.graph.triples.deinit();
-        self.graph.uris.deinit();
     }
 
     pub fn emitTriple(self: *ParserState, object: Term) !void {
@@ -128,11 +166,17 @@ pub fn ParseResult(T: type) type {
     };
 }
 
+pub var line_count: usize = 0;
+
 /// Convenience function for trimming whitespace off the front of an input slice.
 /// Returns the trimmed slice.
 fn consumeWhitespace(input: []const u8) []const u8 {
     var i: usize = 0;
-    while (i < input.len and std.ascii.isWhitespace(input[i])) : (i += 1) {}
+    while (i < input.len and std.ascii.isWhitespace(input[i])) : (i += 1) {
+        if (input[i] == '\n') {
+            line_count += 1;
+        }
+    }
     return input[i..];
 }
 
@@ -418,8 +462,19 @@ fn parseQuotedString(input: []const u8, quote: []const u8) ParseError!ParseResul
     if (!std.mem.startsWith(u8, input, quote)) return ParseError.InvalidString;
 
     var pos: usize = quote.len; // typically 1
+    var escaped = false;
     while (pos < input.len) {
-        if (input[pos] == quote[0] and (pos == quote.len or input[pos - 1] != '\\')) {
+        if (escaped) {
+            escaped = false;
+            pos += 1;
+            continue;
+        }
+        if (input[pos] == '\\') {
+            escaped = true;
+            pos += 1;
+            continue;
+        }
+        if (input[pos] == quote[0]) {
             return ParseResult([]const u8){
                 .value = input[quote.len..pos],
                 .rest = input[pos + 1 ..],
@@ -841,6 +896,7 @@ test "parse string literal" {
 test "parse literal with language tag" {
     var state = ParserState.init(std.testing.allocator);
     defer state.deinit();
+    defer state.graph.deinit();
 
     const input = "\"hello\"@en";
     const result = try parseLiteral(&state, input);
@@ -857,6 +913,7 @@ test "parse long string literal" {
 test "parse boolean literal" {
     var state = ParserState.init(std.testing.allocator);
     defer state.deinit();
+    defer state.graph.deinit();
 
     const input = "true";
     const result = try parseLiteral(&state, input);
@@ -870,6 +927,7 @@ test "parse boolean literal" {
 test "parse integer" {
     var state = ParserState.init(std.testing.allocator);
     defer state.deinit();
+    defer state.graph.deinit();
 
     const input = "42";
     const result = try parseLiteral(&state, input);
@@ -883,6 +941,7 @@ test "parse integer" {
 test "parse empty collection" {
     var state = ParserState.init(std.testing.allocator);
     defer state.deinit();
+    defer state.graph.deinit();
 
     const input = "()";
     const result = try parseCollection(&state, input);
@@ -945,6 +1004,7 @@ test "parse turtle document" {
 test "verify stored triple" {
     var state = ParserState.init(std.testing.allocator);
     defer state.deinit();
+    defer state.graph.deinit();
 
     const input = "<http://ex.org/s> <http://ex.org/p> <http://ex.org/o> .";
     _ = try parseStatement(&state, input);
