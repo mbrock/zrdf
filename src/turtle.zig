@@ -24,39 +24,62 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-pub const URL = struct {
-    url: []const u8,
+pub const URI = struct {
+    str: []const u8,
 };
 
 pub const Term = union(enum) {
-    uri: URL,
-    bnode: BNode,
+    uri: u28,
+    bno: BNode,
     lit: Literal,
 };
 
 pub const BNode = struct {
-    id: []const u8,
+    str: []const u8,
 };
 
 pub const Literal = struct {
     value: []const u8,
     lang: ?[]const u8,
-    datatype: ?URL,
+    datatype: ?URI,
 };
 
-pub const Statement = struct {
-    subject: Term,
-    predicate: Term,
-    object: Term,
+pub const Triple = struct {
+    s: Term,
+    p: Term,
+    o: Term,
 };
 
 pub const Graph = struct {
-    statements: std.ArrayList(Statement),
+    triples: std.ArrayList(Triple),
+    uris: std.ArrayList(URI),
+
+    pub fn intern(self: *Graph, uri: []const u8) !u28 {
+        // find the uri in the list
+        var i: u28 = 0;
+        for (self.uris.items) |u| {
+            if (std.mem.eql(u8, u.str, uri)) {
+                return i;
+            }
+            i += 1;
+        }
+        // if not found, add it to the list
+        try self.uris.append(URI{ .str = uri });
+        return @intCast(self.uris.items.len - 1);
+    }
+
+    pub fn getURI(self: *Graph, id: u28) !URI {
+        return self.uris.items[id];
+    }
+
+    pub fn getURIString(self: *Graph, id: u28) ![]const u8 {
+        return self.uris.items[id].str;
+    }
 };
 
 pub const ParserState = struct {
-    base_uri: ?URL,
-    prefixes: std.StringHashMap(URL),
+    base_uri: ?URI,
+    prefixes: std.StringHashMap(URI),
     bnode_labels: std.StringHashMap(BNode),
     cur_subject: ?Term,
     cur_predicate: ?Term,
@@ -66,19 +89,23 @@ pub const ParserState = struct {
     pub fn init(allocator: std.mem.Allocator) ParserState {
         return .{
             .base_uri = null,
-            .prefixes = std.StringHashMap(URL).init(allocator),
+            .prefixes = std.StringHashMap(URI).init(allocator),
             .bnode_labels = std.StringHashMap(BNode).init(allocator),
             .cur_subject = null,
             .cur_predicate = null,
             .allocator = allocator,
-            .graph = Graph{ .statements = std.ArrayList(Statement).init(allocator) },
+            .graph = Graph{
+                .triples = std.ArrayList(Triple).init(allocator),
+                .uris = std.ArrayList(URI).init(allocator),
+            },
         };
     }
 
     pub fn deinit(self: *ParserState) void {
         self.prefixes.deinit();
         self.bnode_labels.deinit();
-        self.graph.statements.deinit();
+        self.graph.triples.deinit();
+        self.graph.uris.deinit();
     }
 
     pub fn emitTriple(self: *ParserState, object: Term) !void {
@@ -86,10 +113,10 @@ pub const ParserState = struct {
             return ParseError.InvalidTriple;
         }
 
-        try self.graph.statements.append(Statement{
-            .subject = self.cur_subject.?,
-            .predicate = self.cur_predicate.?,
-            .object = object,
+        try self.graph.triples.append(Triple{
+            .s = self.cur_subject.?,
+            .p = self.cur_predicate.?,
+            .o = object,
         });
     }
 };
@@ -121,7 +148,7 @@ fn consumeSingleToken(input: []const u8, token: u8) ParseError![]const u8 {
 
 /// Helper to read a bracketed IRI like `<http://...>`
 /// and return the URL plus the remaining input.
-pub fn readBracketedURI(input: []const u8) ParseError!ParseResult(URL) {
+pub fn readBracketedURI(input: []const u8) ParseError!ParseResult(URI) {
     var rest = consumeWhitespace(input);
 
     if (rest.len < 2) return ParseError.EmptyURL;
@@ -131,8 +158,8 @@ pub fn readBracketedURI(input: []const u8) ParseError!ParseResult(URL) {
     while (pos < rest.len) {
         if (rest[pos] == '>') {
             if (pos == 1) return ParseError.EmptyURL; // empty < >
-            return ParseResult(URL){
-                .value = URL{ .url = rest[1..pos] },
+            return ParseResult(URI){
+                .value = URI{ .str = rest[1..pos] },
                 .rest = rest[pos + 1 ..],
             };
         }
@@ -141,36 +168,36 @@ pub fn readBracketedURI(input: []const u8) ParseError!ParseResult(URL) {
     return ParseError.MissingCloseBracket;
 }
 
-// Factor out repeated code for reading @base and @prefix directives
-fn parseDirective(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
+fn parseEndOfStatement(input: []const u8, T: type, value: T) ParseError!ParseResult(T) {
     var rest = consumeWhitespace(input);
-
-    // Check for @prefix
-    if (std.mem.startsWith(u8, rest, "@prefix")) {
-        const result = try parsePrefix(state, rest);
-        rest = consumeWhitespace(result.rest);
-        rest = try consumeSingleToken(rest, '.'); // consume the trailing '.'
-        return ParseResult(void){ .value = {}, .rest = rest };
-    }
-    // Check for @base
-    else if (std.mem.startsWith(u8, rest, "@base")) {
-        const result = try parseBase(state, rest);
-        rest = consumeWhitespace(result.rest);
-        rest = try consumeSingleToken(rest, '.');
-        return ParseResult(void){ .value = {}, .rest = rest };
-    }
-
-    // Not a recognized directive
-    return ParseError.InvalidStatement;
+    rest = try consumeSingleToken(rest, '.');
+    return ParseResult(T){ .value = value, .rest = rest };
 }
 
-// Example of factoring out whitespace skipping in parseBase
-pub fn parseBase(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = consumeWhitespace(input);
-    if (!std.mem.startsWith(u8, rest, "@base")) {
-        return ParseError.InvalidBase;
+fn parseDirective(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
+    const rest = consumeWhitespace(input);
+
+    if (parsePrefix(state, rest)) |result| {
+        return try parseEndOfStatement(result.rest, void, {});
+    } else |_| {
+        if (parseBase(state, rest)) |result| {
+            return try parseEndOfStatement(result.rest, void, {});
+        } else |_| {
+            return ParseError.InvalidStatement;
+        }
     }
-    rest = consumeWhitespace(rest[5..]); // skip "@base"
+}
+
+fn parseExactString(input: []const u8, expected: []const u8, err: ParseError) ParseError![]const u8 {
+    var rest = consumeWhitespace(input);
+    if (!std.mem.startsWith(u8, rest, expected)) {
+        return err;
+    }
+    return consumeWhitespace(rest[expected.len..]);
+}
+
+pub fn parseBase(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
+    const rest = try parseExactString(input, "@base", ParseError.InvalidBase);
 
     const iri = try readBracketedURI(rest);
     state.base_uri = iri.value;
@@ -182,11 +209,7 @@ pub fn parseBase(state: *ParserState, input: []const u8) ParseError!ParseResult(
 }
 
 pub fn parsePrefix(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = consumeWhitespace(input);
-    if (!std.mem.startsWith(u8, rest, "@prefix")) {
-        return ParseError.InvalidPrefix;
-    }
-    rest = consumeWhitespace(rest[7..]); // skip "@prefix"
+    var rest = try parseExactString(input, "@prefix", ParseError.InvalidPrefix);
 
     // Parse prefix name until ':'
     const colon_pos = std.mem.indexOf(u8, rest, ":");
@@ -225,17 +248,17 @@ pub fn parseBlankNode(state: *ParserState, input: []const u8) ParseError!ParseRe
 
     if (state.bnode_labels.get(label)) |existing| {
         return ParseResult(Term){
-            .value = Term{ .bnode = existing },
+            .value = Term{ .bno = existing },
             .rest = rest,
         };
     }
 
     // Create new blank node
-    const bnode = BNode{ .id = label };
+    const bnode = BNode{ .str = label };
     try state.bnode_labels.put(label, bnode);
 
     return ParseResult(Term){
-        .value = Term{ .bnode = bnode },
+        .value = Term{ .bno = bnode },
         .rest = rest,
     };
 }
@@ -286,7 +309,7 @@ pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseRe
     if (rest[0] == 'a' and
         (rest.len == 1 or std.ascii.isWhitespace(rest[1]) or isTurtleDelimiter(rest[1])))
     {
-        const rdf_type = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" };
+        const rdf_type = try state.graph.intern("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
         return ParseResult(Term){ .value = Term{ .uri = rdf_type }, .rest = rest[1..] };
     }
 
@@ -294,7 +317,7 @@ pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseRe
     if (rest[0] == '<') {
         const iri = try readBracketedURI(rest);
         return ParseResult(Term){
-            .value = Term{ .uri = iri.value },
+            .value = Term{ .uri = try state.graph.intern(iri.value.str) },
             .rest = iri.rest,
         };
     }
@@ -302,7 +325,7 @@ pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseRe
     // Prefixed name
     const prefixed = try parsePrefixedName(state, rest);
     return ParseResult(Term){
-        .value = Term{ .uri = prefixed.value },
+        .value = Term{ .uri = try state.graph.intern(prefixed.value.str) },
         .rest = prefixed.rest,
     };
 }
@@ -347,7 +370,10 @@ pub fn parseObject(state: *ParserState, input: []const u8) ParseError!ParseResul
     // IRI
     if (rest[0] == '<') {
         const iri = try readBracketedURI(rest);
-        return ParseResult(Term){ .value = Term{ .uri = iri.value }, .rest = iri.rest };
+        return ParseResult(Term){
+            .value = Term{ .uri = try state.graph.intern(iri.value.str) },
+            .rest = iri.rest,
+        };
     }
     // Blank node
     if (std.mem.startsWith(u8, rest, "_:")) {
@@ -364,7 +390,7 @@ pub fn parseObject(state: *ParserState, input: []const u8) ParseError!ParseResul
     // Prefixed name
     const prefixed = try parsePrefixedName(state, rest);
     return ParseResult(Term){
-        .value = Term{ .uri = prefixed.value },
+        .value = Term{ .uri = try state.graph.intern(prefixed.value.str) },
         .rest = prefixed.rest,
     };
 }
@@ -495,7 +521,7 @@ fn parseNumber(input: []const u8) ParseError!ParseResult(Term) {
         .value = Term{ .lit = .{
             .value = number,
             .lang = null,
-            .datatype = URL{ .url = datatype },
+            .datatype = URI{ .str = datatype },
         } },
         .rest = rest[pos..],
     };
@@ -553,7 +579,7 @@ pub fn parseLiteral(state: *ParserState, input: []const u8) ParseError!ParseResu
             .value = Term{ .lit = .{
                 .value = val,
                 .lang = null,
-                .datatype = URL{ .url = "http://www.w3.org/2001/XMLSchema#boolean" },
+                .datatype = URI{ .str = "http://www.w3.org/2001/XMLSchema#boolean" },
             } },
             .rest = rest[bool_str.len..],
         };
@@ -580,7 +606,7 @@ pub fn parseCollection(state: *ParserState, input: []const u8) ParseError!ParseR
     if (rest.len > 0 and rest[0] == ')') {
         return ParseResult(Term){
             .value = Term{
-                .uri = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil" },
+                .uri = try state.graph.intern("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"),
             },
             .rest = rest[1..],
         };
@@ -590,19 +616,19 @@ pub fn parseCollection(state: *ParserState, input: []const u8) ParseError!ParseR
     const first_obj = try parseObject(state, rest);
     rest = consumeWhitespace(first_obj.rest);
 
-    const first_bnode = BNode{ .id = try generateBNodeId(state) };
-    try state.bnode_labels.put(first_bnode.id, first_bnode);
+    const first_bnode = BNode{ .str = try generateBNodeId(state) };
+    try state.bnode_labels.put(first_bnode.str, first_bnode);
 
     // store for later restore
     const saved_subject = state.cur_subject;
     const saved_predicate = state.cur_predicate;
 
-    const first_pred = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first" };
-    const rest_pred = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest" };
+    const first_pred = URI{ .str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first" };
+    const rest_pred = URI{ .str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest" };
 
     // first triple
-    state.cur_subject = Term{ .bnode = first_bnode };
-    state.cur_predicate = Term{ .uri = first_pred };
+    state.cur_subject = Term{ .bno = first_bnode };
+    state.cur_predicate = Term{ .uri = try state.graph.intern(first_pred.str) };
     try state.emitTriple(first_obj.value);
 
     var current_bnode = first_bnode;
@@ -612,26 +638,26 @@ pub fn parseCollection(state: *ParserState, input: []const u8) ParseError!ParseR
         const next_obj = try parseObject(state, rest);
         rest = consumeWhitespace(next_obj.rest);
 
-        const next_bnode = BNode{ .id = try generateBNodeId(state) };
-        try state.bnode_labels.put(next_bnode.id, next_bnode);
+        const next_bnode = BNode{ .str = try generateBNodeId(state) };
+        try state.bnode_labels.put(next_bnode.str, next_bnode);
 
         // link current
-        state.cur_subject = Term{ .bnode = current_bnode };
-        state.cur_predicate = Term{ .uri = rest_pred };
-        try state.emitTriple(Term{ .bnode = next_bnode });
+        state.cur_subject = Term{ .bno = current_bnode };
+        state.cur_predicate = Term{ .uri = try state.graph.intern(rest_pred.str) };
+        try state.emitTriple(Term{ .bno = next_bnode });
 
         // next triple
-        state.cur_subject = Term{ .bnode = next_bnode };
-        state.cur_predicate = Term{ .uri = first_pred };
+        state.cur_subject = Term{ .bno = next_bnode };
+        state.cur_predicate = Term{ .uri = try state.graph.intern(first_pred.str) };
         try state.emitTriple(next_obj.value);
 
         current_bnode = next_bnode;
     }
 
     // final rest -> nil
-    state.cur_subject = Term{ .bnode = current_bnode };
-    state.cur_predicate = Term{ .uri = rest_pred };
-    try state.emitTriple(Term{ .uri = URL{ .url = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil" } });
+    state.cur_subject = Term{ .bno = current_bnode };
+    state.cur_predicate = Term{ .uri = try state.graph.intern(rest_pred.str) };
+    try state.emitTriple(Term{ .uri = try state.graph.intern("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil") });
 
     // restore
     state.cur_subject = saved_subject;
@@ -640,7 +666,7 @@ pub fn parseCollection(state: *ParserState, input: []const u8) ParseError!ParseR
     if (rest.len == 0 or rest[0] != ')') return ParseError.InvalidCollection;
 
     return ParseResult(Term){
-        .value = Term{ .bnode = first_bnode },
+        .value = Term{ .bno = first_bnode },
         .rest = rest[1..],
     };
 }
@@ -650,7 +676,7 @@ fn generateBNodeId(state: *ParserState) ![]const u8 {
     return std.fmt.allocPrint(state.allocator, "b{d}", .{count});
 }
 
-pub fn parsePrefixedName(state: *ParserState, input: []const u8) ParseError!ParseResult(URL) {
+pub fn parsePrefixedName(state: *ParserState, input: []const u8) ParseError!ParseResult(URI) {
     var rest = consumeWhitespace(input);
     var prefix_end: usize = 0;
 
@@ -682,10 +708,10 @@ pub fn parsePrefixedName(state: *ParserState, input: []const u8) ParseError!Pars
     else
         state.prefixes.get(prefix) orelse return ParseError.InvalidPrefix;
 
-    const full_url = try std.fmt.allocPrint(state.allocator, "{s}{s}", .{ base_iri.url, local });
+    const full_url = try std.fmt.allocPrint(state.allocator, "{s}{s}", .{ base_iri.str, local });
 
-    return ParseResult(URL){
-        .value = URL{ .url = full_url },
+    return ParseResult(URI){
+        .value = URI{ .str = full_url },
         .rest = rest,
     };
 }
@@ -752,7 +778,10 @@ pub fn parseSubject(state: *ParserState, input: []const u8) ParseError!ParseResu
     if (rest[0] == '<') {
         // IRI
         const iri = try readBracketedURI(rest);
-        return ParseResult(Term){ .value = Term{ .uri = iri.value }, .rest = iri.rest };
+        return ParseResult(Term){
+            .value = Term{ .uri = try state.graph.intern(iri.value.str) },
+            .rest = iri.rest,
+        };
     }
     if (std.mem.startsWith(u8, rest, "_:")) {
         // blank node
@@ -760,7 +789,10 @@ pub fn parseSubject(state: *ParserState, input: []const u8) ParseError!ParseResu
     }
     // prefixed
     const prefixed = try parsePrefixedName(state, rest);
-    return ParseResult(Term){ .value = Term{ .uri = prefixed.value }, .rest = prefixed.rest };
+    return ParseResult(Term){
+        .value = Term{ .uri = try state.graph.intern(prefixed.value.str) },
+        .rest = prefixed.rest,
+    };
 }
 
 pub fn parseBlankNodePropertyList(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
@@ -768,15 +800,15 @@ pub fn parseBlankNodePropertyList(state: *ParserState, input: []const u8) ParseE
     if (rest.len == 0 or rest[0] != '[') return ParseError.InvalidBlankNode;
     rest = consumeWhitespace(rest[1..]);
 
-    const bnode = BNode{ .id = try generateBNodeId(state) };
-    try state.bnode_labels.put(bnode.id, bnode);
+    const bnode = BNode{ .str = try generateBNodeId(state) };
+    try state.bnode_labels.put(bnode.str, bnode);
 
     // Save current subject/predicate
     const saved_subject = state.cur_subject;
     const saved_predicate = state.cur_predicate;
 
     // Switch subject to new blank node
-    state.cur_subject = Term{ .bnode = bnode };
+    state.cur_subject = Term{ .bno = bnode };
 
     // If not empty, parse the predicate-object list
     if (rest.len > 0 and rest[0] != ']') {
@@ -791,7 +823,7 @@ pub fn parseBlankNodePropertyList(state: *ParserState, input: []const u8) ParseE
     if (rest.len == 0 or rest[0] != ']') return ParseError.InvalidBlankNode;
 
     return ParseResult(Term){
-        .value = Term{ .bnode = bnode },
+        .value = Term{ .bno = bnode },
         .rest = rest[1..],
     };
 }
@@ -831,7 +863,7 @@ test "parse boolean literal" {
     try std.testing.expectEqualStrings("true", result.value.lit.value);
     try std.testing.expectEqualStrings(
         "http://www.w3.org/2001/XMLSchema#boolean",
-        result.value.lit.datatype.?.url,
+        result.value.lit.datatype.?.str,
     );
 }
 
@@ -844,7 +876,7 @@ test "parse integer" {
     try std.testing.expectEqualStrings("42", result.value.lit.value);
     try std.testing.expectEqualStrings(
         "http://www.w3.org/2001/XMLSchema#integer",
-        result.value.lit.datatype.?.url,
+        result.value.lit.datatype.?.str,
     );
 }
 
@@ -856,7 +888,7 @@ test "parse empty collection" {
     const result = try parseCollection(&state, input);
     try std.testing.expectEqualStrings(
         "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
-        result.value.uri.url,
+        (try state.graph.getURIString(result.value.uri)),
     );
 }
 
@@ -869,7 +901,7 @@ test "parse collection with items" {
 
     const input = "(<http://ex.org/a> <http://ex.org/b>)";
     const result = try parseCollection(&state, input);
-    try std.testing.expect(result.value == .bnode);
+    try std.testing.expect(result.value == .bno);
 }
 
 test "parse prefixed name" {
@@ -881,11 +913,11 @@ test "parse prefixed name" {
     // No need to defer state.deinit() since arena will free everything
 
     // Add a prefix mapping
-    try state.prefixes.put("ex", URL{ .url = "http://example.org/" });
+    try state.prefixes.put("ex", URI{ .str = "http://example.org/" });
 
     const input = "ex:something";
     const result = try parsePrefixedName(&state, input);
-    try std.testing.expectEqualStrings("http://example.org/something", result.value.url);
+    try std.testing.expectEqualStrings("http://example.org/something", result.value.str);
 }
 
 test "parse turtle document" {
@@ -907,7 +939,7 @@ test "parse turtle document" {
 
     const result = try parseTurtleDocument(&state, input);
     try std.testing.expect(result.rest.len == 0);
-    try std.testing.expect(state.graph.statements.items.len > 0);
+    try std.testing.expect(state.graph.triples.items.len > 0);
 }
 
 test "verify stored triple" {
@@ -917,11 +949,22 @@ test "verify stored triple" {
     const input = "<http://ex.org/s> <http://ex.org/p> <http://ex.org/o> .";
     _ = try parseStatement(&state, input);
 
-    try std.testing.expectEqual(@as(usize, 1), state.graph.statements.items.len);
-    const triple = state.graph.statements.items[0];
-    try std.testing.expectEqualStrings("http://ex.org/s", triple.subject.uri.url);
-    try std.testing.expectEqualStrings("http://ex.org/p", triple.predicate.uri.url);
-    try std.testing.expectEqualStrings("http://ex.org/o", triple.object.uri.url);
+    try std.testing.expectEqual(@as(usize, 1), state.graph.triples.items.len);
+
+    const triple = state.graph.triples.items[0];
+
+    try std.testing.expectEqualStrings(
+        "http://ex.org/s",
+        try state.graph.getURIString(triple.s.uri),
+    );
+    try std.testing.expectEqualStrings(
+        "http://ex.org/p",
+        try state.graph.getURIString(triple.p.uri),
+    );
+    try std.testing.expectEqualStrings(
+        "http://ex.org/o",
+        try state.graph.getURIString(triple.o.uri),
+    );
 }
 
 test "verify stored collection" {
@@ -940,7 +983,7 @@ test "verify stored collection" {
     // 3. b0 rest b1
     // 4. b1 first b
     // 5. b1 rest nil
-    try std.testing.expectEqual(@as(usize, 5), state.graph.statements.items.len);
+    try std.testing.expectEqual(@as(usize, 5), state.graph.triples.items.len);
 }
 
 test "parse nested collections" {
@@ -963,7 +1006,7 @@ test "parse nested collections" {
     // 7. b3 first c
     // 8. b3 rest nil
     // 9. b1 rest nil
-    try std.testing.expectEqual(@as(usize, 9), state.graph.statements.items.len);
+    try std.testing.expectEqual(@as(usize, 9), state.graph.triples.items.len);
 }
 
 test "parse complex turtle document" {
@@ -995,16 +1038,28 @@ test "parse complex turtle document" {
     var found_age = false;
     var found_interests = false;
 
-    for (state.graph.statements.items) |stmt| {
-        if (std.mem.eql(u8, stmt.predicate.uri.url, "http://xmlns.com/foaf/0.1/name")) {
-            if (std.mem.eql(u8, stmt.object.lit.value, "John Smith")) {
+    for (state.graph.triples.items) |stmt| {
+        if (std.mem.eql(
+            u8,
+            try state.graph.getURIString(stmt.p.uri),
+            "http://xmlns.com/foaf/0.1/name",
+        )) {
+            if (std.mem.eql(u8, stmt.o.lit.value, "John Smith")) {
                 found_name = true;
             }
-        } else if (std.mem.eql(u8, stmt.predicate.uri.url, "http://xmlns.com/foaf/0.1/age")) {
-            if (std.mem.eql(u8, stmt.object.lit.value, "42")) {
+        } else if (std.mem.eql(
+            u8,
+            try state.graph.getURIString(stmt.p.uri),
+            "http://xmlns.com/foaf/0.1/age",
+        )) {
+            if (std.mem.eql(u8, stmt.o.lit.value, "42")) {
                 found_age = true;
             }
-        } else if (std.mem.eql(u8, stmt.predicate.uri.url, "http://xmlns.com/foaf/0.1/interests")) {
+        } else if (std.mem.eql(
+            u8,
+            try state.graph.getURIString(stmt.p.uri),
+            "http://xmlns.com/foaf/0.1/interests",
+        )) {
             found_interests = true;
         }
     }
@@ -1030,9 +1085,13 @@ test "parse list with different literal types" {
     var found_boolean = false;
     var found_decimal = false;
 
-    for (state.graph.statements.items) |stmt| {
-        if (std.mem.eql(u8, stmt.predicate.uri.url, "http://www.w3.org/1999/02/22-rdf-syntax-ns#first")) {
-            switch (stmt.object) {
+    for (state.graph.triples.items) |stmt| {
+        if (std.mem.eql(
+            u8,
+            try state.graph.getURIString(stmt.p.uri),
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#first",
+        )) {
+            switch (stmt.o) {
                 .lit => |lit| {
                     if (std.mem.eql(u8, lit.value, "string")) {
                         found_string = true;
@@ -1073,9 +1132,9 @@ test "parse empty list in different contexts" {
 
     // Verify we have the correct number of nil references
     var nil_count: usize = 0;
-    for (state.graph.statements.items) |stmt| {
-        if (stmt.object == .uri and
-            std.mem.eql(u8, stmt.object.uri.url, "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"))
+    for (state.graph.triples.items) |stmt| {
+        if (stmt.o == .uri and
+            std.mem.eql(u8, try state.graph.getURIString(stmt.o.uri), "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"))
         {
             nil_count += 1;
         }
@@ -1097,39 +1156,39 @@ test "parse blank node property list" {
     // Should have 2 triples:
     // 1. s p b0
     // 2. b0 p2 "value"
-    try std.testing.expectEqual(@as(usize, 2), state.graph.statements.items.len);
+    try std.testing.expectEqual(@as(usize, 2), state.graph.triples.items.len);
 
     // print the triples
-    for (state.graph.statements.items) |stmt| {
-        switch (stmt.subject) {
-            .uri => std.debug.print("Subject: {s}\n", .{stmt.subject.uri.url}),
-            .bnode => std.debug.print("Subject: {s}\n", .{stmt.subject.bnode.id}),
+    for (state.graph.triples.items) |stmt| {
+        switch (stmt.s) {
+            .uri => std.debug.print("Subject: {s}\n", .{try state.graph.getURIString(stmt.s.uri)}),
+            .bno => std.debug.print("Subject: {s}\n", .{stmt.s.bno.str}),
             else => @panic("Invalid subject"),
         }
-        switch (stmt.predicate) {
-            .uri => std.debug.print("Predicate: {s}\n", .{stmt.predicate.uri.url}),
+        switch (stmt.p) {
+            .uri => std.debug.print("Predicate: {s}\n", .{try state.graph.getURIString(stmt.p.uri)}),
             else => @panic("Invalid predicate"),
         }
-        switch (stmt.object) {
-            .lit => std.debug.print("Object: {s}\n", .{stmt.object.lit.value}),
-            .bnode => std.debug.print("Object: {s}\n", .{stmt.object.bnode.id}),
-            .uri => std.debug.print("Object: {s}\n", .{stmt.object.uri.url}),
+        switch (stmt.o) {
+            .lit => std.debug.print("Object: {s}\n", .{stmt.o.lit.value}),
+            .bno => std.debug.print("Object: {s}\n", .{stmt.o.bno.str}),
+            .uri => std.debug.print("Object: {s}\n", .{try state.graph.getURIString(stmt.o.uri)}),
         }
     }
 
-    const second_triple = state.graph.statements.items[0];
-    try std.testing.expect(second_triple.subject == .bnode);
-    try std.testing.expect(second_triple.predicate == .uri);
-    try std.testing.expectEqualStrings("http://ex.org/p2", second_triple.predicate.uri.url);
-    try std.testing.expect(second_triple.object == .lit);
-    try std.testing.expectEqualStrings("value", second_triple.object.lit.value);
+    const second_triple = state.graph.triples.items[0];
+    try std.testing.expect(second_triple.s == .bno);
+    try std.testing.expect(second_triple.p == .uri);
+    try std.testing.expectEqualStrings("http://ex.org/p2", try state.graph.getURIString(second_triple.p.uri));
+    try std.testing.expect(second_triple.o == .lit);
+    try std.testing.expectEqualStrings("value", second_triple.o.lit.value);
 
-    const first_triple = state.graph.statements.items[1];
-    try std.testing.expect(first_triple.subject == .uri);
-    try std.testing.expectEqualStrings("http://ex.org/s", first_triple.subject.uri.url);
-    try std.testing.expect(first_triple.predicate == .uri);
-    try std.testing.expectEqualStrings("http://ex.org/p", first_triple.predicate.uri.url);
-    try std.testing.expect(first_triple.object == .bnode);
+    const first_triple = state.graph.triples.items[1];
+    try std.testing.expect(first_triple.s == .uri);
+    try std.testing.expectEqualStrings("http://ex.org/s", try state.graph.getURIString(first_triple.s.uri));
+    try std.testing.expect(first_triple.p == .uri);
+    try std.testing.expectEqualStrings("http://ex.org/p", try state.graph.getURIString(first_triple.p.uri));
+    try std.testing.expect(first_triple.o == .bno);
 }
 
 test "parse nested blank node property lists" {
@@ -1150,5 +1209,5 @@ test "parse nested blank node property lists" {
     // 1. s p b0
     // 2. b0 p1 b1
     // 3. b1 p2 "nested"
-    try std.testing.expectEqual(@as(usize, 3), state.graph.statements.items.len);
+    try std.testing.expectEqual(@as(usize, 3), state.graph.triples.items.len);
 }

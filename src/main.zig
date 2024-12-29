@@ -29,25 +29,25 @@ pub fn main() !void {
 
     // Print parsed triples
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("\nParsed {d} triples:\n", .{state.graph.statements.items.len});
+    try stdout.print("\nParsed {d} triples:\n", .{state.graph.triples.items.len});
 
-    for (state.graph.statements.items) |statement| {
-        try printTerm(stdout, statement.subject);
+    for (state.graph.triples.items) |statement| {
+        try printTerm(stdout, statement.s);
         try stdout.writeAll(" ");
-        try printTerm(stdout, statement.predicate);
+        try printTerm(stdout, statement.p);
         try stdout.writeAll(" ");
-        try printTerm(stdout, statement.object);
+        try printTerm(stdout, statement.o);
         try stdout.writeAll(" .\n");
     }
 }
 
 fn printTerm(writer: anytype, term: turtle.Term) !void {
     switch (term) {
-        .uri => |u| try writer.print("<{s}>", .{u.url}),
+        .uri => |u| try writer.print("<{s}>", .{u.str}),
         .bnode => |b| try writer.print("_:{s}", .{b.id}),
         .lit => |l| {
             if (l.datatype) |dt| {
-                try writer.print("\"{s}\"^^<{s}>", .{ l.value, dt.url });
+                try writer.print("\"{s}\"^^<{s}>", .{ l.value, dt.str });
             } else if (l.lang) |lang| {
                 try writer.print("\"{s}\"@{s}", .{ l.value, lang });
             } else {
