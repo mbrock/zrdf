@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
 
     // Create the url_parser module
     const url_parser_module = b.addModule("url_parser", .{
-        .source_file = b.path("src/url_parser.zig"),
+        .root_source_file = b.path("src/url_parser.zig"),
     });
 
     const lib = b.addStaticLibrary(.{
