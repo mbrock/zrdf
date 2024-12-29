@@ -1,13 +1,13 @@
 const std = @import("std");
-const root = @import("root.zig");
+const turtle = @import("turtle.zig");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    var state = root.ParserState.init(allocator);
-    defer state.deinit();
+    var state = turtle.ParserState.init(allocator);
+    // No need to defer state.deinit() since arena will free everything
 
     // Example Turtle document
     const turtle_doc =
@@ -25,14 +25,7 @@ pub fn main() !void {
     ;
 
     // Parse document
-    var rest = turtle_doc;
-    while (rest.len > 0) {
-        rest = std.mem.trimLeft(u8, rest, &std.ascii.whitespace);
-        if (rest.len == 0) break;
-
-        const result = try root.parseStatement(&state, rest);
-        rest = result.rest;
-    }
+    _ = try turtle.parseTurtleDocument(&state, turtle_doc);
 
     // Print parsed triples
     const stdout = std.io.getStdOut().writer();
@@ -48,7 +41,7 @@ pub fn main() !void {
     }
 }
 
-fn printTerm(writer: anytype, term: root.Term) !void {
+fn printTerm(writer: anytype, term: turtle.Term) !void {
     switch (term) {
         .uri => |u| try writer.print("<{s}>", .{u.url}),
         .bnode => |b| try writer.print("_:{s}", .{b.id}),
@@ -66,7 +59,7 @@ fn printTerm(writer: anytype, term: root.Term) !void {
 
 test "simple test" {
     var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
+    defer list.deinit();
     try list.append(42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());
 }
