@@ -231,7 +231,7 @@ fn skipWhitespace(input: []const u8) []const u8 {
 
 // Add statement parsing
 pub fn parseStatement(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
+    const rest = skipWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
     // Try parsing directive
@@ -264,7 +264,7 @@ pub fn parseStatement(state: *ParserState, input: []const u8) ParseError!ParseRe
 }
 
 pub fn parseTriples(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
+    const rest = skipWhitespace(input);
 
     // Parse subject
     const subject = try parseSubject(state, rest);
@@ -590,7 +590,7 @@ pub fn parseLiteral(state: *ParserState, input: []const u8) ParseError!ParseResu
             };
         } else if (rest.len > 1 and rest[0] == '^' and rest[1] == '^') {
             rest = rest[2..];
-            const dtype = try parseIRI(state, rest);
+            const dtype = try readBracketedURI(rest);
             return ParseResult(Term){
                 .value = Term{ .lit = .{
                     .value = str.value,
@@ -710,7 +710,7 @@ fn parseNumber(input: []const u8) ParseError!ParseResult(Term) {
     }
 
     // Parse integer part
-    var start_digits = pos;
+    const start_digits = pos;
     while (pos < rest.len and isDigit(rest[pos])) {
         pos += 1;
     }
