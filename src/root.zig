@@ -429,7 +429,7 @@ pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseRe
 }
 
 pub fn parseObjectList(state: *ParserState, input: []const u8) ParseError!ParseResult(void) {
-    var rest = skipWhitespace(input);
+    const rest = skipWhitespace(input);
 
     while (true) {
         // Parse object
