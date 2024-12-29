@@ -397,7 +397,7 @@ pub fn parsePredicateObjectList(
 }
 
 pub fn parsePredicate(state: *ParserState, input: []const u8) ParseError!ParseResult(Term) {
-    var rest = skipWhitespace(input);
+    const rest = skipWhitespace(input);
     if (rest.len == 0) return ParseError.UnexpectedEndOfInput;
 
     // Handle 'a' as rdf:type shorthand
