@@ -72,10 +72,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Add url_parser.zig to the test suite
-    unit_tests.addModule("url_parser", b.createModule(.{
-        .source_file = b.path("src/url_parser.zig"),
-    }));
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
