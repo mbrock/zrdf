@@ -27,7 +27,7 @@ pub fn main() !void {
     // Parse document
     var rest = turtle_doc;
     while (rest.len > 0) {
-        rest = std.mem.trimLeft(u8, rest, &std.ascii.whitespace);
+        rest = std.mem.trimLeft(u8, rest, std.ascii.whitespace);
         if (rest.len == 0) break;
 
         const result = try root.parseStatement(&state, rest);
